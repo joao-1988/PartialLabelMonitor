@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from scipy import stats
+import matplotlib.pyplot as plt
 
 class RatioModel():
 
@@ -17,30 +18,26 @@ class RatioModel():
     return self
 
 class ModelAnalytics:
-    def __init__(self, data, predict_col, target_long_col, target_short_col):
+    def __init__(self, data, predict_col, target_long_col, target_short_col, metric, by='batch'):
         """
-        Initialize the ModelAnalytics with a DataFrame.
+        Initialize the ModelAnalytics.
 
         Parameters:
             data (pd.DataFrame): DataFrame containing the data.
             predict_col (str): Name of the column containing prediction values.
             target_long_col (str): Column name for long-term target values.
             target_short_col (str): Column name for short-term target values.
+            metric (callable): A callable that calculates a metric with format parameters y and pred.
+            by (str): Column name to group by.
         """
-        self.data = data
+        #self.data = data
         self.predict_col = predict_col
         self.target_long_col = target_long_col
         self.target_short_col = target_short_col
+        self.data_metric = self.__metric_estimation(data, metric, by)
 
-    def mae(self, y, pred):
-        """Calculate Mean Absolute Error between observations and predictions."""
-        return np.mean(np.abs(y - pred))
 
-    def ratio_mae(self, y, pred, naive):
-        """Calculate the ratio of MAE to a naive prediction's MAE."""
-        return 1 - (self.mae(y, pred) / self.mae(y, naive))
-
-    def metric_estimation(self, metric, by='batch'):
+    def __metric_estimation(self, data, metric, by):
         """
         Calculate specified metrics for each target grouped by a column.
 
@@ -52,9 +49,9 @@ class ModelAnalytics:
             pd.DataFrame: DataFrame containing calculated metrics for each group.
         """
         if by:
-            grouped = self.data.groupby(by)
+            grouped = data.groupby(by)
         else:
-            grouped = self.data
+            grouped = data
 
         results = []
         for target in [self.target_long_col, self.target_short_col]:
@@ -63,41 +60,141 @@ class ModelAnalytics:
 
         df_metric = pd.concat(results, axis=1)
         df_metric.columns = ['metric_long', 'metric_short']
-        self.data_metric = df_metric
+        return df_metric
+   
+    def split(self, test_size=0.2, random_state=1):
+        """
+        Splits the data into training and validation sets without stratification.
+
+        Parameters:
+            test_size (float): Proportion of the dataset to include in the test split.
+            random_state (int): Seed used by the random number generator for reproducibility.
+
+        Returns:
+            df_train (DataFrame): Training subset of the original data.
+            df_val (DataFrame): Validation subset of the original data.
+        """
+        np.random.seed(random_state)
+        # Shuffle the data
+        indices = self.data_metric.index
+        shuffled_indices = np.random.permutation(indices)
+        test_set_size = int(len(indices) * test_size)
+        self.train_indices = shuffled_indices[test_set_size:]
+        self.test_indices = shuffled_indices[:test_set_size]
+
         return
 
-    def get_conformal_prediction(self, y, pred, conf=0.9):
-        """Calculate the conformal prediction interval based on confidence level."""
-        abs_err = np.abs(y - pred)
-        return np.quantile(abs_err, conf)
-
-    def train_and_evaluate(self, model=RatioModel(), test_size=0.2, random_state=1, conf=0.9):
+    def train(self, model):
         """
-        Train a model and evaluate its performance.
+        Train the model using the provided data.
 
         Parameters:
             model (model): Machine learning model to be trained.
             test_size (float): Proportion of the dataset to include in the test split.
             random_state (int): The seed used by the random number generator.
+
+        Returns:
+            model: Trained model.
+            DataFrame: Training subset of the original data.
+            DataFrame: Validation subset of the original data.
+        """
+        df_train = self.data_metric.iloc[self.train_indices]
+        model.fit(df_train[['metric_short']], df_train['metric_long'])
+        return model
+
+    def __mae(self, y, pred):
+        """Calculate Mean Absolute Error between observations and predictions."""
+        return np.mean(np.abs(y - pred))
+
+    def __ratio_mae(self, y, pred, naive):
+        """Calculate the ratio of MAE to a naive prediction's MAE."""
+        return 1 - (self.__mae(y, pred) / self.__mae(y, naive))
+
+    def __uncertainty(self, y, pred, conf=0.9):
+        """Calculate the conformal prediction interval based on confidence level."""
+        abs_err = np.abs(y - pred)
+        return np.quantile(abs_err, conf)
+
+    def evaluate(self, model, conf=0.9):
+        """
+        Evaluate the model using the validation data.
+
+        Parameters:
+            model (model): Trained machine learning model.
+            df_val (DataFrame): Validation data used for evaluation.
             conf (float): Confidence level for conformal prediction.
 
         Returns:
-            tuple: Trained model, conformal prediction value, validation DataFrame
+            float: Conformal prediction value.
+            float: Pearson correlation coefficient.
+            float: Mean Absolute Error.
+            float: Ratio MAE.
         """
-        df_train, df_val = train_test_split(self.data_metric, test_size=test_size, random_state=random_state)
-        model.fit(df_train[['metric_short']], df_train['metric_long'])
+        df_train = self.data_metric.iloc[self.train_indices]
+        df_test = self.data_metric.iloc[self.test_indices]
 
-        pred_val = model.predict(df_val[['metric_short']])
-        df_val['metric_predict'] = pred_val
+        pred = model.predict(df_test[['metric_short']])
+        y = df_test['metric_long']
+        naive = df_train['metric_long'].mean()
 
-        conf_pred = self.get_conformal_prediction(df_val['metric_long'], pred_val, conf)
+        uncertainty = self.__uncertainty(y, pred, conf)
+        pearson_corr = stats.pearsonr(y, pred)[0]
+        mae = self.__mae(y, pred)
+        ratio_mae = self.__ratio_mae(y, pred, naive)
 
-        print('Conformal Prediction:', conf_pred)
-        print('Pearson Correlation:', stats.pearsonr(pred_val, df_val['metric_long'])[0])
-        print('MAE:', self.mae(pred_val, df_val['metric_long']))
-        print('Ratio MAE:', self.ratio_mae(df_val['metric_long'], pred_val, naive=df_train['metric_long'].mean()))
+        dict = {'Uncertainty': uncertainty
+                ,'Pearson Correlation': pearson_corr
+                ,'MAE': mae
+                ,'Ratio MAE': ratio_mae}
 
-        self.model_metric = model
+        return dict
+    
+    def apply_model(self, model, uncertainty):
+        """
+        Applies the provided model to the data and calculates Conformal Predictions.
 
-        return model, conf_pred, df_val
+        Parameters:
+            model (model): The model to be applied.
+            uncertainty (float): The uncertainty factor used to calculate the Conformal Predictions.
 
+        Adds the following columns to the DataFrame:
+        - 'metric_predict': The predicted values from the model.
+        - 'cp_inf': Lower bound of the Conformal Predictions.
+        - 'cp_sup': Upper bound of the Conformal Predictions.
+        """
+        self.data_metric['metric_predict'] = model.predict(self.data_metric[['metric_short']])
+        self.data_metric['cp_inf'] = self.data_metric['metric_predict'] - uncertainty
+        self.data_metric['cp_sup'] = self.data_metric['metric_predict'] + uncertainty
+
+    def plot_estimation(self, figsize=(10, 4), ylim=[0.7,1]):
+        """
+        Generates a plot for metrics with Conformal Predictions.
+
+        Parameters:
+            df (pd.DataFrame): DataFrame containing the metrics and Conformal Predictions data.
+
+        The DataFrame must contain the following columns:
+        - 'metric_long'
+        - 'metric_predict'
+        - 'cp_inf'
+        - 'cp_sup'
+        """
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.plot(self.data_metric.index, self.data_metric['metric_long'], label='Metric Long')
+        ax.plot(self.data_metric.index, self.data_metric['metric_predict'], label='Metric Predict')
+        ax.fill_between(self.data_metric.index, self.data_metric['cp_inf']
+                        , self.data_metric['cp_sup'], color='gray'
+                        , alpha=0.3, label='Conformal Interval')
+
+        # Remove top and right spines
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+        ax.set_ylim(ylim)
+        ax.legend()
+
+        plt.title("Metric Long vs. Metric Predict with Conformal Predictions")
+        #plt.xlabel("Index")
+        plt.ylabel("Metric Values")
+        plt.grid(True, linestyle='--', alpha=0.5)  # Make grid less prominent
+        plt.show()       
